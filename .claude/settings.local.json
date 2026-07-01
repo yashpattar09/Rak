@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p extracted/captures extracted/seed)",
+      "Bash(unzip -o -q \"captures1 \\(1\\).zip\" -d extracted/captures)",
+      "Bash(unzip -o -q \"seed2 \\(1\\).zip\" -d extracted/seed)",
+      "Bash(python -c \"import cv2; print\\('opencv', cv2.__version__\\)\")",
+      "Bash(python -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python *)",
+      "Bash(unzip -o -q \"captured_images.zip\" -d extracted/captured_images)",
+      "Bash(start \"\" \"F:\\\\Rak\\\\results_drone_full\\\\dashboard.html\")",
+      "Bash(pip install *)",
+      "Bash(start python *)",
+      "Bash(start \"\" http://localhost:5000)",
+      "Bash(taskkill /IM python.exe /F)",
+      "Bash(tasklist)",
+      "Bash(netstat -ano)",
+      "PowerShell(Get-Process *)",
+      "Bash(unzip -o \"seed2 \\(2\\).zip\" -d extracted_seed2)",
+      "Bash(wait)",
+      "Bash(grep -v \"^total\\\\|^d.* \\\\.$\\\\|^d.* \\\\.\\\\.$\")"
+    ]
+  }
+}

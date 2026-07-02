@@ -5,19 +5,16 @@ Core method (unchanged, chosen originally by measurement):
   Both images resized to 128x128 -> ResNet18 CNN embedding (512-d) ->
   cosine similarity -> optimal one-to-one assignment (Hungarian).
 
-Accuracy add-ons layered ON TOP of that core (compute is cheap on the GPU):
-  1. DINOv2 (ViT) global descriptor at full resolution with multi-scale +
-     flip test-time augmentation. Far more discriminative than a 128px
-     ResNet18 for telling near-identical "brown dirt" scenes apart.
-  2. SIFT + RANSAC geometric verification at full resolution. Counts the
-     number of geometrically-consistent keypoint correspondences between a
-     reference and a candidate — direct physical evidence that two frames
-     show the SAME arrangement, and a trustworthy confidence signal.
+Accuracy add-on layered ON TOP of that core (compute is cheap on the GPU):
+  DINOv2 (ViT) global descriptor at full resolution with multi-scale +
+  flip test-time augmentation. Far more discriminative than a 128px
+  ResNet18 for telling near-identical "brown dirt" scenes apart.
 
-The three signals are min-max normalised and fused into one score matrix,
-then the SAME Hungarian assignment runs on it. If DINOv2 or SIFT are
-unavailable (e.g. offline), those signals silently switch off and the
-pipeline degrades exactly to the original ResNet18@128 behaviour.
+The two signals are min-max normalised and fused into one score matrix,
+then the SAME Hungarian assignment runs on it. If DINOv2 is unavailable
+(e.g. offline), that signal silently switches off and the pipeline
+degrades exactly to the original ResNet18@128 behaviour. Match confidence
+is decided purely by the fused percentage similarity.
 """
 import os
 import zipfile
@@ -41,16 +38,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---- accuracy add-on config (auto-disabled if a signal can't load) ----
 USE_DINO = True                  # DINOv2 global descriptor
-USE_GEOM = True                  # SIFT + RANSAC geometric verification
-# fusion weights (renormalised over whatever signals load). Geometry is
-# weighted highest: RANSAC-verified correspondences are the closest thing to
-# ground-truth evidence that two frames show the same physical arrangement;
-# the deep embeddings mainly rank the ambiguous, low-overlap cases.
-W_CORE, W_DINO, W_GEOM = 0.15, 0.35, 0.50
-GEOM_MAXSIDE = 1600              # longest image side used for SIFT
-GEOM_CAP = 40                    # inliers are clipped here before normalising
-CONF_INLIERS = 15                # >= this many RANSAC inliers => confident
-THRESH = 0.55                    # cosine confidence threshold (fallback modes)
+# fusion weights (renormalised over whatever signals load).
+W_CORE, W_DINO = 0.35, 0.65
+THRESH = 0.55                    # percentage confidence threshold
 
 # holds the folder of the most recently uploaded ZIP (None => use default)
 UPLOADED_QUERY_FOLDER = None
@@ -93,17 +83,6 @@ if USE_DINO:
         print("[!] DINOv2 unavailable, continuing without it.")
         USE_DINO = False
 
-# ---- add-on 2: SIFT + RANSAC geometric verification ----
-_sift = _bf = None
-if USE_GEOM:
-    try:
-        _sift = cv2.SIFT_create(nfeatures=8000)
-        _bf = cv2.BFMatcher(cv2.NORM_L2)
-        print("[*] SIFT geometric verification ready.")
-    except Exception as e:
-        print(f"[!] SIFT unavailable, geometric check off: {e}")
-        USE_GEOM = False
-
 
 def _norm01(mat):
     """Min-max normalise a score matrix to [0,1] for fusion."""
@@ -126,30 +105,6 @@ def _dino_embed(rgb_full):
             vecs.append(v)
     v = np.mean(vecs, axis=0)
     return v / (np.linalg.norm(v) + 1e-9)
-
-
-def _sift_feat(gray_full):
-    """SIFT keypoints/descriptors on the full-res (downscaled) grayscale image."""
-    h, w = gray_full.shape
-    s = GEOM_MAXSIDE / max(h, w)
-    if s < 1:
-        gray_full = cv2.resize(gray_full, (int(w * s), int(h * s)))
-    return _sift.detectAndCompute(gray_full, None)
-
-
-def geom_inliers(feat_a, feat_b):
-    """RANSAC-verified correspondence count between two SIFT feature sets."""
-    (k1, d1), (k2, d2) = feat_a, feat_b
-    if d1 is None or d2 is None or len(k1) < 8 or len(k2) < 8:
-        return 0
-    good = [m for m, n in _bf.knnMatch(d1, d2, k=2)
-            if m.distance < 0.75 * n.distance]
-    if len(good) < 12:
-        return 0
-    p1 = np.float32([k1[m.queryIdx].pt for m in good])
-    p2 = np.float32([k2[m.trainIdx].pt for m in good])
-    _H, mask = cv2.findHomography(p1, p2, cv2.USAC_MAGSAC, 4.0)
-    return int(mask.sum()) if mask is not None else 0
 
 
 def list_images(folder):
@@ -185,16 +140,11 @@ def embed_and_save(name, path, is_ref):
     if USE_DINO:
         rec["dino"] = _dino_embed(cv2.cvtColor(img_full, cv2.COLOR_BGR2RGB))
 
-    # ---- add-on 2: SIFT features on the full-res image ----
-    if USE_GEOM:
-        rec["feat"] = _sift_feat(cv2.cvtColor(img_full, cv2.COLOR_BGR2GRAY))
-
     return rec
 
 
 def run_matching():
-    active = ["ResNet18@128"] + (["DINOv2"] if USE_DINO else []) \
-             + (["SIFT-geom"] if USE_GEOM else [])
+    active = ["ResNet18@128"] + (["DINOv2"] if USE_DINO else [])
     print("\n" + "=" * 70)
     print("MATCHING  (" + " + ".join(active) + " -> fused -> Hungarian)")
     print("=" * 70)
@@ -228,12 +178,6 @@ def run_matching():
         sim_dino = DR @ DQ.T
         signals.append((W_DINO, _norm01(sim_dino)))
 
-    geom = None
-    if USE_GEOM:
-        geom = np.array([[geom_inliers(r["feat"], q["feat"]) for q in queries]
-                         for r in refs], dtype=float)
-        signals.append((W_GEOM, _norm01(np.clip(geom, 0, GEOM_CAP))))
-
     wsum = sum(w for w, _ in signals)
     fused = sum(w * s for w, s in signals) / wsum
 
@@ -251,30 +195,23 @@ def run_matching():
         if j is None:
             results.append({"reference": ref["name"], "ref_path": ref["disp"],
                             "query": None, "query_path": None, "similarity": 0,
-                            "geo": 0, "confident": False})
+                            "confident": False})
             continue
         q = queries[j]
         s = float(head[i, j])
-        gi = int(geom[i, j]) if geom is not None else 0
-
-        # confidence: geometric evidence is trusted first, else cosine threshold
-        if USE_GEOM:
-            confident = gi >= CONF_INLIERS
-        else:
-            confident = s >= THRESH
+        confident = s >= THRESH
 
         # top-3 by fused score, for transparency
         order = np.argsort(-fused[i])
         top3 = [{"name": queries[k]["name"], "path": queries[k]["disp"],
-                 "sim": round(float(head[i, k]) * 100),
-                 "geo": int(geom[i, k]) if geom is not None else 0}
+                 "sim": round(float(head[i, k]) * 100)}
                 for k in order[:3]]
         print(f"    {ref['name'][:26]:<26} -> {q['name'][:26]:<26} "
-              f"{s*100:5.1f}%  geo={gi:<3d} {'OK' if confident else 'weak'}")
+              f"{s*100:5.1f}%  {'OK' if confident else 'weak'}")
         results.append({
             "reference": ref["name"], "ref_path": ref["disp"],
             "query": q["name"], "query_path": q["disp"],
-            "similarity": round(s * 100), "geo": gi,
+            "similarity": round(s * 100),
             "confident": confident, "top3": top3,
         })
     print("=" * 70 + "\n")
@@ -383,7 +320,7 @@ PAGE = """
 <div class="container">
   <header>
     <h1>🎯 Image Matcher</h1>
-    <p>Upload a ZIP of images — each is matched against the reference set (captures1) using a fused pipeline: ResNet18@128 + DINOv2 global descriptor + SIFT/RANSAC geometric verification. The <b>geo</b> badge = geometrically-consistent keypoint matches (higher = stronger physical evidence).</p>
+    <p>Upload a ZIP of images — each is matched against the reference set (captures1) using a fused pipeline: ResNet18@128 + DINOv2 global descriptor. Confidence is decided by the fused similarity percentage.</p>
   </header>
   <div class="bar">
     <label class="uploadbtn">📁 Upload ZIP
@@ -392,7 +329,7 @@ PAGE = """
     <button id="btn" onclick="go()">▶ Start Matching</button>
     <div id="upinfo" style="margin-top:10px;font-size:13px;color:#eee"></div>
   </div>
-  <div class="loading" id="load"><div class="spinner"></div><p>Embedding (ResNet18 + DINOv2) & geometric verification…</p></div>
+  <div class="loading" id="load"><div class="spinner"></div><p>Embedding (ResNet18 + DINOv2)…</p></div>
   <div id="sum"></div>
   <div class="results" id="res"></div>
 </div>
@@ -426,16 +363,16 @@ async function go(){
 function render(rs){
   const conf=rs.filter(r=>r.confident).length;
   document.getElementById('sum').innerHTML=
-    `<div class="summary"><b>✓ ${conf}/${rs.length} confident matches</b> — fused ResNet18@128 + DINOv2 + SIFT/RANSAC geometric verification, one-to-one (Hungarian) assignment. % = DINOv2 visual similarity; <b>geo</b> = RANSAC-verified keypoint correspondences (the confidence driver — ≥15 = confident).</div>`;
+    `<div class="summary"><b>✓ ${conf}/${rs.length} confident matches</b> — fused ResNet18@128 + DINOv2, one-to-one (Hungarian) assignment. % = fused visual similarity (≥55% = confident).</div>`;
   document.getElementById('res').innerHTML=rs.map(r=>{
     if(!r.query) return `<div class="card"><div class="head"><span class="title">${r.reference}</span></div><div class="body"><div class="nomatch">no match</div></div></div>`;
     const wk=r.confident?'':'weak';
     return `<div class="card ${wk}">
-      <div class="head"><span class="title">${r.reference}</span><span class="pct ${wk}">${r.similarity}% · geo ${r.geo}</span></div>
+      <div class="head"><span class="title">${r.reference}</span><span class="pct ${wk}">${r.similarity}%</span></div>
       <div class="body"><div class="pair">
         <div class="col"><img src="/img/${encodeURIComponent(r.ref_path)}"><div class="lab">Reference<br><span class="badge">${r.confident?'confident':'weak'}</span></div></div>
         <div class="arrow">→</div>
-        <div class="col"><img src="/img/${encodeURIComponent(r.query_path)}"><div class="lab">${r.query}<br><span class="badge">geo ${r.geo}</span></div></div>
+        <div class="col"><img src="/img/${encodeURIComponent(r.query_path)}"><div class="lab">${r.query}</div></div>
       </div></div></div>`;
   }).join('');
 }
@@ -443,8 +380,7 @@ function render(rs){
 """
 
 if __name__ == "__main__":
-    signals = "ResNet18@128" + (" + DINOv2" if USE_DINO else "") \
-              + (" + SIFT-geom" if USE_GEOM else "")
+    signals = "ResNet18@128" + (" + DINOv2" if USE_DINO else "")
     print("=" * 70)
     print("Seed2 Matcher — http://localhost:5000")
     print(f"Reference: {REF_FOLDER}   Captured: {QUERY_FOLDER}")
